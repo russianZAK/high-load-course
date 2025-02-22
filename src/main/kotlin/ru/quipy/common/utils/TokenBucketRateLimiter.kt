@@ -38,6 +38,12 @@ class TokenBucketRateLimiter(
         }
     }.invokeOnCompletion { th -> if (th != null) logger.error("Rate limiter release job completed", th) }
 
+    fun tickBlocking() {
+        while (!tick()) {
+            Thread.sleep(5)
+        }
+    }
+
     override fun tick(): Boolean {
         while (true) {
             val tokensAvailable = bucket.get()
