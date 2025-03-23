@@ -3,6 +3,7 @@ package ru.quipy.payments.logic
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import okhttp3.OkHttpClient
@@ -42,9 +43,9 @@ class PaymentExternalSystemAdapterImpl(
         Duration.ofSeconds(1).toMillis(),
         TimeUnit.MILLISECONDS
     )
-    private val processingTimeMillis = 3500L
-    private val semaphore = Semaphore(parallelRequests)
-    private val client = OkHttpClient.Builder().build()
+    private val processingTimeMillis = 5000L
+    private val semaphore = FairSemaphore(parallelRequests)
+    private val client = OkHttpClient.Builder().callTimeout(Duration.ofMillis(requestAverageProcessingTime.toMillis() + 100)).build()
     private val coroutineScope = CoroutineScope(Dispatchers.IO)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -99,7 +100,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private suspend fun processRequest(request: Request, paymentId: UUID, transactionId: UUID): Boolean {
         val semaphoreStartTime = now()
-        semaphore.withPermit {
+        return semaphore.withPermit {
             val semaphoreTime = now() - semaphoreStartTime
             val rateLimiterLeftTime = processingTimeMillis - semaphoreTime
 
@@ -123,9 +124,9 @@ class PaymentExternalSystemAdapterImpl(
                         it.logProcessing(body.result, now(), transactionId, reason = body.message)
                     }
                 }
-                return response.success
+                return@withPermit response.success
             } catch (exception: Exception) {
-                return false
+                return@withPermit false
             }
         }
     }
@@ -137,8 +138,8 @@ class PaymentExternalSystemAdapterImpl(
     override fun name() = properties.accountName
 
     private suspend fun retryWithBackOff(
-        maxAttempts: Int = 2,
-        initialDelay: Long = 400,
+        maxAttempts: Int = 4,
+        initialDelay: Long = 200,
         block: suspend () -> Boolean
     ) {
         repeat(maxAttempts) {
@@ -151,3 +152,20 @@ class PaymentExternalSystemAdapterImpl(
 }
 
 public fun now() = System.currentTimeMillis()
+
+class FairSemaphore(permits: Int) {
+    private val queue = Channel<Unit>(permits)
+
+    init {
+        repeat(permits) { queue.trySend(Unit) }
+    }
+
+    suspend fun <T> withPermit(action: suspend () -> T): T {
+        queue.receive()
+        try {
+            return action()
+        } finally {
+            queue.send(Unit)
+        }
+    }
+}
