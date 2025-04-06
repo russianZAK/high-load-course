@@ -22,6 +22,30 @@
     </properties>
 
 	<dependencies>
+<!--        <dependency>-->
+<!--            <groupId>io.ktor</groupId>-->
+<!--            <artifactId>ktor-client-core-jvm</artifactId>-->
+<!--            <version>3.1.2</version>-->
+<!--        </dependency>-->
+
+<!--        <dependency>-->
+<!--            <groupId>io.ktor</groupId>-->
+<!--            <artifactId>ktor-client-cio-jvm</artifactId>-->
+<!--            <version>3.1.2</version>-->
+<!--        </dependency>-->
+
+<!--        <dependency>-->
+<!--            <groupId>io.ktor</groupId>-->
+<!--            <artifactId>ktor-client-content-negotiation-jvm</artifactId>-->
+<!--            <version>3.1.2</version>-->
+<!--        </dependency>-->
+
+<!--        <dependency>-->
+<!--            <groupId>io.ktor</groupId>-->
+<!--            <artifactId>ktor-serialization-kotlinx-json-jvm</artifactId>-->
+<!--            <version>3.1.2</version>-->
+<!--        </dependency>-->
+
         <dependency>
             <groupId>com.fasterxml.jackson.datatype</groupId>
             <artifactId>jackson-datatype-jsr310</artifactId>
@@ -124,6 +148,12 @@
         <dependency>
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.tomcat.embed</groupId>
+            <artifactId>tomcat-embed-core</artifactId>
+            <version>9.0.85</version>
         </dependency>
     </dependencies>
 

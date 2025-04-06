@@ -6,20 +6,17 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
+import okhttp3.*
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.net.SocketTimeoutException
+import java.io.IOException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
 
-
-// Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
@@ -27,8 +24,6 @@ class PaymentExternalSystemAdapterImpl(
 
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
-
-        val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
     }
 
@@ -43,10 +38,22 @@ class PaymentExternalSystemAdapterImpl(
         Duration.ofSeconds(1).toMillis(),
         TimeUnit.MILLISECONDS
     )
-    private val processingTimeMillis = 5000L
-    private val semaphore = FairSemaphore(parallelRequests)
-    private val client = OkHttpClient.Builder().callTimeout(Duration.ofMillis(requestAverageProcessingTime.toMillis() + 100)).build()
-    private val coroutineScope = CoroutineScope(Dispatchers.IO)
+    private val processingTimeMillis = 50_000L
+    private val client = OkHttpClient.Builder()
+        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+        .connectionPool(ConnectionPool(350, 5, TimeUnit.MINUTES))
+        .dispatcher(Dispatcher().apply {
+            maxRequests = 1000
+            maxRequestsPerHost = 1000
+        })
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
+        .callTimeout(requestAverageProcessingTime.toMillis() * 2, TimeUnit.MILLISECONDS)
+        .build()
+
+    private val coroutineScope = CoroutineScope(Dispatchers.Default)
+    private val semaphore = Semaphore(parallelRequests)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         coroutineScope.launch {
@@ -55,21 +62,18 @@ class PaymentExternalSystemAdapterImpl(
             val transactionId = UUID.randomUUID()
             logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
 
-            // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
-            // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
             paymentESService.update(paymentId) {
                 it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
             }
 
-            val request = Request.Builder().run {
-                url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                post(emptyBody)
-            }.build()
-
+            val request = Request.Builder()
+                .url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                .post(RequestBody.create(null, ByteArray(0)))
+                .build()
 
             try {
                 withTimeout(processingTimeMillis) {
-                    retryWithBackOff {
+                    retryWithExponentialBackOff {
                         processRequest(request, paymentId, transactionId)
                     }
                 }
@@ -80,92 +84,67 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private fun handlePaymentException(e: Exception, paymentId: UUID, transactionId: UUID) {
-        when (e) {
-            is SocketTimeoutException -> {
-                logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                }
-            }
-
-            else -> {
-                logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = e.message)
-                }
-            }
+        logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+        paymentESService.update(paymentId) {
+            it.logProcessing(false, now(), transactionId, reason = e.message)
         }
     }
 
     private suspend fun processRequest(request: Request, paymentId: UUID, transactionId: UUID): Boolean {
         val semaphoreStartTime = now()
-        return semaphore.withPermit {
+        semaphore.withPermit {
             val semaphoreTime = now() - semaphoreStartTime
             val rateLimiterLeftTime = processingTimeMillis - semaphoreTime
-
             if (!tokenBucketRateLimiter.tryTick(rateLimiterLeftTime, TimeUnit.MILLISECONDS)) {
                 throw Exception("Not enough time left for payment processing")
             }
-            try {
-                val response = client.newCall(request).execute().use { response ->
-                    val body = try {
-                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+
+            return suspendCancellableCoroutine { continuation ->
+                client.newCall(request).enqueue(object : Callback {
+                    override fun onFailure(call: Call, e: IOException) {
+                        logger.error("[$accountName] Request failed: txId=$transactionId, payment=$paymentId", e)
+                        continuation.resume(false)
                     }
 
-                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+                    override fun onResponse(call: Call, response: Response) {
+                        response.use {
+                            val body = try {
+                                mapper.readValue(it.body?.string(), ExternalSysResponse::class.java)
+                            } catch (e: Exception) {
+                                logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                            }
 
-                    // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                    // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                            logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                            }
+
+                            continuation.resume(body.result)
+                        }
                     }
-                }
-                return@withPermit response.success
-            } catch (exception: Exception) {
-                return@withPermit false
+                })
             }
         }
     }
 
     override fun price() = properties.price
-
     override fun isEnabled() = properties.enabled
-
     override fun name() = properties.accountName
 
-    private suspend fun retryWithBackOff(
-        maxAttempts: Int = 4,
-        initialDelay: Long = 200,
+    private suspend fun retryWithExponentialBackOff(
+        maxAttempts: Int = 3,
+        initialDelay: Long = 2000L,
         block: suspend () -> Boolean
     ) {
+        var delayTime = initialDelay
         repeat(maxAttempts) {
-            val result = block()
-            if (result) return
-            delay(initialDelay)
-        }
-    }
-
-}
-
-public fun now() = System.currentTimeMillis()
-
-class FairSemaphore(permits: Int) {
-    private val queue = Channel<Unit>(permits)
-
-    init {
-        repeat(permits) { queue.trySend(Unit) }
-    }
-
-    suspend fun <T> withPermit(action: suspend () -> T): T {
-        queue.receive()
-        try {
-            return action()
-        } finally {
-            queue.send(Unit)
+            if (block()) return
+            delay(delayTime)
+            delayTime *= 2
         }
     }
 }
+
+fun now() = System.currentTimeMillis()
