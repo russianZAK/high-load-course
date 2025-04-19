@@ -1,0 +1,17 @@
+{
+	"ulid": "01JRJ494BT2SQFWCPK1JRP2Q0X",
+	"minTime": 1744354391236,
+	"maxTime": 1744358400000,
+	"stats": {
+		"numSamples": 6892,
+		"numSeries": 23,
+		"numChunks": 48
+	},
+	"compaction": {
+		"level": 1,
+		"sources": [
+			"01JRJ494BT2SQFWCPK1JRP2Q0X"
+		]
+	},
+	"version": 1
+}
