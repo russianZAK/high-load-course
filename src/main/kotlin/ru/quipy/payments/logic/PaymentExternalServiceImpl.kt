@@ -12,8 +12,10 @@ import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.io.IOException
+import java.net.http.HttpClient
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 
@@ -39,67 +41,69 @@ class PaymentExternalSystemAdapterImpl(
         TimeUnit.MILLISECONDS
     )
     private val processingTimeMillis = 50_000L
+
     private val client = OkHttpClient.Builder()
-        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
-        .connectionPool(ConnectionPool(350, 5, TimeUnit.MINUTES))
+        .protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE))
+        .connectionPool(ConnectionPool(5000, 5, TimeUnit.MINUTES))
         .dispatcher(Dispatcher().apply {
-            maxRequests = 1000
-            maxRequestsPerHost = 1000
+            maxRequests = 5000
+            maxRequestsPerHost = 5000
         })
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .writeTimeout(60, TimeUnit.SECONDS)
-        .callTimeout(requestAverageProcessingTime.toMillis() * 2, TimeUnit.MILLISECONDS)
         .build()
 
-    private val coroutineScope = CoroutineScope(Dispatchers.Default)
     private val semaphore = Semaphore(parallelRequests)
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        coroutineScope.launch {
-            logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+    override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
-            val transactionId = UUID.randomUUID()
-            logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
+        val transactionId = UUID.randomUUID()
+        logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
 
+        withContext(Dispatchers.IO) {
             paymentESService.update(paymentId) {
                 it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
             }
+        }
 
-            val request = Request.Builder()
-                .url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                .post(RequestBody.create(null, ByteArray(0)))
-                .build()
+        val duration = Duration.ofMillis(requestAverageProcessingTime.toMillis() * 2)
+        val request = Request.Builder()
+            .url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=$duration")
+            .post(RequestBody.create(null, ByteArray(0)))
+            .build()
 
-            try {
-                withTimeout(processingTimeMillis) {
-                    retryWithExponentialBackOff {
-                        processRequest(request, paymentId, transactionId)
-                    }
+        try {
+            withTimeout(processingTimeMillis) {
+                retryWithExponentialBackOff {
+                    processRequest(request, paymentId, transactionId)
                 }
-            } catch (e: Exception) {
-                handlePaymentException(e, paymentId, transactionId)
             }
+        } catch (e: Exception) {
+            handlePaymentException(e, paymentId, transactionId)
         }
     }
 
-    private fun handlePaymentException(e: Exception, paymentId: UUID, transactionId: UUID) {
+    private suspend fun handlePaymentException(e: Exception, paymentId: UUID, transactionId: UUID) {
         logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-        paymentESService.update(paymentId) {
-            it.logProcessing(false, now(), transactionId, reason = e.message)
+        withContext(Dispatchers.IO) {
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = e.message)
+            }
         }
     }
 
     private suspend fun processRequest(request: Request, paymentId: UUID, transactionId: UUID): Boolean {
         val semaphoreStartTime = now()
-        semaphore.withPermit {
+        return semaphore.withPermit {
             val semaphoreTime = now() - semaphoreStartTime
             val rateLimiterLeftTime = processingTimeMillis - semaphoreTime
             if (!tokenBucketRateLimiter.tryTick(rateLimiterLeftTime, TimeUnit.MILLISECONDS)) {
                 throw Exception("Not enough time left for payment processing")
             }
 
-            return suspendCancellableCoroutine { continuation ->
+            return@withPermit suspendCancellableCoroutine { continuation ->
                 client.newCall(request).enqueue(object : Callback {
                     override fun onFailure(call: Call, e: IOException) {
                         logger.error("[$accountName] Request failed: txId=$transactionId, payment=$paymentId", e)
@@ -117,9 +121,9 @@ class PaymentExternalSystemAdapterImpl(
 
                             logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
 
-                            paymentESService.update(paymentId) {
-                                it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                            }
+                                paymentESService.update(paymentId) {
+                                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                                }
 
                             continuation.resume(body.result)
                         }
@@ -134,15 +138,30 @@ class PaymentExternalSystemAdapterImpl(
     override fun name() = properties.accountName
 
     private suspend fun retryWithExponentialBackOff(
-        maxAttempts: Int = 3,
-        initialDelay: Long = 2000L,
+        maxAttempts: Int = 2,
+        initialDelay: Long = 200L,
         block: suspend () -> Boolean
     ) {
-        var delayTime = initialDelay
         repeat(maxAttempts) {
             if (block()) return
-            delay(delayTime)
-            delayTime *= 2
+            delay(initialDelay)
+        }
+    }
+}
+
+class FairSemaphore(permits: Int) {
+    private val queue = Channel<Unit>(permits)
+
+    init {
+        repeat(permits) { queue.trySend(Unit) }
+    }
+
+    suspend fun <T> withPermit(action: suspend () -> T): T {
+        queue.receive()
+        try {
+            return action()
+        } finally {
+            queue.send(Unit)
         }
     }
 }

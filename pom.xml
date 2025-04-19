@@ -122,6 +122,11 @@
             <scope>test</scope>
         </dependency>
 
+<!--        <dependency>-->
+<!--            <groupId>org.springframework.boot</groupId>-->
+<!--            <artifactId>spring-boot-starter-webflux</artifactId>-->
+<!--        </dependency>-->
+
         <dependency>
             <groupId>ru.quipy</groupId>
             <artifactId>tiny-event-sourcing-spring-boot-starter</artifactId>

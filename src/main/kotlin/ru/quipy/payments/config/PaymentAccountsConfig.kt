@@ -34,6 +34,10 @@ class PaymentAccountsConfig {
 
     @Bean
     fun accountAdapters(paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>): List<PaymentExternalSystemAdapter> {
+
+        println("Sending request to: http://${paymentProviderHostPort}/external/accounts?serviceName=onlineStore")
+
+
         val request = HttpRequest.newBuilder()
             .uri(URI("http://${paymentProviderHostPort}/external/accounts?serviceName=onlineStore")) // todo sukhoa service name
             .GET()
